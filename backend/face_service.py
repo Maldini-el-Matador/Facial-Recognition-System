@@ -1,6 +1,9 @@
 """
 Face Recognition Service
 Handles face detection, encoding, and matching.
+
+Uses a custom PyTorch model trained on LFW dataset for face embeddings.
+Falls back to random embeddings if model is not yet trained.
 """
 import os
 import io
@@ -9,18 +12,17 @@ from typing import Optional, Tuple, List
 import numpy as np
 from PIL import Image
 
-# Try to import face_recognition, fall back to mock if not available
-try:
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError:
-    FACE_RECOGNITION_AVAILABLE = False
-    print("[WARNING] face_recognition not installed. Using mock mode for demo.")
+from model_inference import get_model, FaceRecognitionModel
 
 import database as db
 
-# Threshold for face matching (lower = stricter)
-FACE_MATCH_TOLERANCE = 0.6
+# Threshold for face matching (cosine similarity, higher = stricter)
+FACE_MATCH_THRESHOLD = 0.55
+
+# Initialize the model
+face_model = get_model()
+FACE_RECOGNITION_AVAILABLE = face_model.model_loaded
+
 
 def decode_base64_image(base64_string: str) -> np.ndarray:
     """Convert base64 image string to numpy array."""
@@ -37,6 +39,7 @@ def decode_base64_image(base64_string: str) -> np.ndarray:
     
     return np.array(image)
 
+
 def save_user_photo(user_id: str, image_array: np.ndarray) -> str:
     """Save user photo to disk."""
     photo_dir = "known_faces"
@@ -48,50 +51,44 @@ def save_user_photo(user_id: str, image_array: np.ndarray) -> str:
     
     return photo_path
 
+
 def get_face_encoding(image_array: np.ndarray) -> Optional[np.ndarray]:
-    """Extract face encoding from image."""
-    if not FACE_RECOGNITION_AVAILABLE:
-        # Mock: return random encoding for demo
-        return np.random.rand(128)
+    """Extract face encoding (embedding) from image using trained model."""
+    # Detect faces first
+    faces = face_model.detect_faces(image_array)
     
-    # Detect face locations
-    face_locations = face_recognition.face_locations(image_array)
-    
-    if not face_locations:
+    if not faces:
         return None
     
-    # Get encoding for the first face found
-    encodings = face_recognition.face_encodings(image_array, face_locations)
+    # Get embedding for the first (largest/most confident) face
+    face_box = faces[0]
+    embedding = face_model.get_embedding(image_array, face_box=face_box)
     
-    if encodings:
-        return encodings[0]
-    return None
+    return embedding
+
 
 def detect_face(image_array: np.ndarray) -> Tuple[bool, dict]:
     """
     Detect if a face is present in the image.
     Returns (success, face_info)
     """
-    if not FACE_RECOGNITION_AVAILABLE:
-        # Mock: always detect a face for demo
-        h, w = image_array.shape[:2]
+    faces = face_model.detect_faces(image_array)
+    
+    if faces:
+        face = faces[0]
         return True, {
             "detected": True,
-            "location": {"top": h//4, "right": 3*w//4, "bottom": 3*h//4, "left": w//4},
-            "confidence": 0.95
-        }
-    
-    face_locations = face_recognition.face_locations(image_array)
-    
-    if face_locations:
-        top, right, bottom, left = face_locations[0]
-        return True, {
-            "detected": True,
-            "location": {"top": top, "right": right, "bottom": bottom, "left": left},
-            "confidence": 0.95
+            "location": {
+                "top": face["top"],
+                "right": face["right"],
+                "bottom": face["bottom"],
+                "left": face["left"],
+            },
+            "confidence": face.get("confidence", 0.95),
         }
     
     return False, {"detected": False, "location": None, "confidence": 0}
+
 
 def register_face(name: str, email: str, base64_image: str) -> Tuple[bool, dict]:
     """
@@ -131,7 +128,7 @@ def register_face(name: str, email: str, base64_image: str) -> Tuple[bool, dict]
     db.log_access(user["id"], user["name"], "registration", "Registration Kiosk")
     
     # Award welcome bonus
-    db.add_loyalty_transaction(user["id"], 0, "Welcome bonus awarded!")  # 100 points already added in create_user
+    db.add_loyalty_transaction(user["id"], 0, "Welcome bonus awarded!")
     
     return True, {
         "user": {
@@ -144,9 +141,10 @@ def register_face(name: str, email: str, base64_image: str) -> Tuple[bool, dict]
         "message": "Registration successful! Welcome bonus: 100 points"
     }
 
+
 def verify_face(base64_image: str) -> Tuple[bool, dict]:
     """
-    Verify a face against registered users.
+    Verify a face against registered users using cosine similarity.
     Returns (success, result)
     """
     # Decode image
@@ -171,27 +169,22 @@ def verify_face(base64_image: str) -> Tuple[bool, dict]:
     if not known_encodings:
         return False, {"error": "No registered users", "code": "NO_USERS"}
     
-    # Compare with all known faces
+    # Compare with all known faces using cosine similarity
     best_match = None
-    best_distance = float('inf')
+    best_similarity = -1.0
     
     for user_id, known_encoding in known_encodings:
-        if FACE_RECOGNITION_AVAILABLE:
-            # Calculate face distance
-            distance = face_recognition.face_distance([known_encoding], encoding)[0]
-        else:
-            # Mock: random distance for demo (simulate 70% match rate)
-            distance = np.random.uniform(0.3, 0.7)
+        similarity = face_model.compare_faces(known_encoding, encoding)
         
-        if distance < best_distance:
-            best_distance = distance
+        if similarity > best_similarity:
+            best_similarity = similarity
             best_match = user_id
     
     # Check if match is good enough
-    if best_distance <= FACE_MATCH_TOLERANCE and best_match:
+    if best_similarity >= FACE_MATCH_THRESHOLD and best_match:
         user = db.get_user(best_match)
         if user:
-            confidence = max(0, min(100, int((1 - best_distance) * 100)))
+            confidence = max(0, min(100, int(best_similarity * 100)))
             return True, {
                 "matched": True,
                 "user": {
@@ -210,8 +203,9 @@ def verify_face(base64_image: str) -> Tuple[bool, dict]:
         "matched": False,
         "error": "Face not recognized",
         "code": "NO_MATCH",
-        "confidence": max(0, int((1 - best_distance) * 100)) if best_distance != float('inf') else 0
+        "confidence": max(0, int(best_similarity * 100)) if best_similarity >= 0 else 0
     }
+
 
 def process_access(base64_image: str, location: str = "Main Entrance", award_points: int = 10) -> Tuple[bool, dict]:
     """
